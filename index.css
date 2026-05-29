@@ -1,0 +1,284 @@
+// ECG signal generation engine
+// Produces realistic PQRST morphology for a variety of cardiac rhythms.
+
+export type RhythmId =
+  | "nsr"
+  | "tachy"
+  | "brady"
+  | "afib"
+  | "pvc"
+  | "vtach"
+  | "vfib"
+  | "asystole"
+  | "stemi";
+
+export interface Rhythm {
+  id: RhythmId;
+  name: string;
+  short: string;
+  description: string;
+  defaultBpm: number;
+  minBpm: number;
+  maxBpm: number;
+  bpmLocked: boolean; // some rhythms ignore the BPM slider
+  danger: "normal" | "warn" | "critical";
+}
+
+export const RHYTHMS: Rhythm[] = [
+  {
+    id: "nsr",
+    name: "Normal Sinus Rhythm",
+    short: "NSR",
+    description: "Regular rhythm with normal P-QRS-T morphology.",
+    defaultBpm: 72,
+    minBpm: 60,
+    maxBpm: 100,
+    bpmLocked: false,
+    danger: "normal",
+  },
+  {
+    id: "brady",
+    name: "Sinus Bradycardia",
+    short: "BRADY",
+    description: "Slow but regular sinus rhythm under 60 bpm.",
+    defaultBpm: 46,
+    minBpm: 30,
+    maxBpm: 59,
+    bpmLocked: false,
+    danger: "warn",
+  },
+  {
+    id: "tachy",
+    name: "Sinus Tachycardia",
+    short: "TACHY",
+    description: "Fast but regular sinus rhythm over 100 bpm.",
+    defaultBpm: 130,
+    minBpm: 101,
+    maxBpm: 180,
+    bpmLocked: false,
+    danger: "warn",
+  },
+  {
+    id: "afib",
+    name: "Atrial Fibrillation",
+    short: "A-FIB",
+    description: "Irregularly irregular, absent P waves, fibrillatory baseline.",
+    defaultBpm: 110,
+    minBpm: 70,
+    maxBpm: 160,
+    bpmLocked: false,
+    danger: "warn",
+  },
+  {
+    id: "pvc",
+    name: "PVCs (Bigeminy)",
+    short: "PVC",
+    description: "Premature ventricular contractions interrupting sinus beats.",
+    defaultBpm: 75,
+    minBpm: 50,
+    maxBpm: 110,
+    bpmLocked: false,
+    danger: "warn",
+  },
+  {
+    id: "stemi",
+    name: "ST-Elevation MI",
+    short: "STEMI",
+    description: "Acute injury pattern with marked ST-segment elevation.",
+    defaultBpm: 96,
+    minBpm: 60,
+    maxBpm: 140,
+    bpmLocked: false,
+    danger: "critical",
+  },
+  {
+    id: "vtach",
+    name: "Ventricular Tachycardia",
+    short: "V-TACH",
+    description: "Wide monomorphic complexes at a rapid rate. Life-threatening.",
+    defaultBpm: 180,
+    minBpm: 150,
+    maxBpm: 250,
+    bpmLocked: false,
+    danger: "critical",
+  },
+  {
+    id: "vfib",
+    name: "Ventricular Fibrillation",
+    short: "V-FIB",
+    description: "Chaotic disorganized activity. Pulseless. Shockable.",
+    defaultBpm: 300,
+    minBpm: 300,
+    maxBpm: 300,
+    bpmLocked: true,
+    danger: "critical",
+  },
+  {
+    id: "asystole",
+    name: "Asystole",
+    short: "ASYS",
+    description: "Absence of electrical activity. Flatline.",
+    defaultBpm: 0,
+    minBpm: 0,
+    maxBpm: 0,
+    bpmLocked: true,
+    danger: "critical",
+  },
+];
+
+export function getRhythm(id: RhythmId): Rhythm {
+  return RHYTHMS.find((r) => r.id === id) ?? RHYTHMS[0];
+}
+
+function gauss(t: number, mu: number, sigma: number, amp: number): number {
+  const d = t - mu;
+  return amp * Math.exp(-(d * d) / (2 * sigma * sigma));
+}
+
+// Smooth bump used for ST-segment plateau
+function plateau(t: number, start: number, end: number, height: number): number {
+  if (t < start || t > end) return 0;
+  const mid = (start + end) / 2;
+  const half = (end - start) / 2;
+  const x = (t - mid) / half; // -1..1
+  return height * Math.exp(-Math.pow(x * 1.6, 4));
+}
+
+interface BeatType {
+  pvc?: boolean;
+  stemi?: boolean;
+}
+
+// Standard PQRST as a function of seconds since beat onset.
+function sinusMorph(t: number, type: BeatType = {}): number {
+  let v = 0;
+  // P wave
+  if (!type.pvc) v += gauss(t, 0.05, 0.018, 0.1);
+  // QRS
+  v += gauss(t, 0.165, 0.0075, -0.06); // Q
+  v += gauss(t, 0.195, 0.0095, 1.0); // R
+  v += gauss(t, 0.232, 0.009, -0.22); // S
+  // ST segment
+  if (type.stemi) v += plateau(t, 0.245, 0.33, 0.35);
+  // T wave
+  v += gauss(t, 0.355, 0.04, type.stemi ? 0.42 : 0.27);
+  return v;
+}
+
+// Wide, bizarre ventricular complex (PVC / V-tach)
+function ventricularMorph(t: number): number {
+  let v = 0;
+  v += gauss(t, 0.16, 0.03, 1.15);
+  v += gauss(t, 0.235, 0.03, -0.55);
+  v += gauss(t, 0.36, 0.055, -0.4); // discordant T
+  return v;
+}
+
+export class EcgGenerator {
+  private rhythm: RhythmId = "nsr";
+  private bpm = 72;
+  private tInBeat = 0;
+  private rr = 60 / 72;
+  private beatIndex = 0;
+  private nextIsPvc = false;
+  private clock = 0; // global clock for noise-based rhythms
+  private lastBeatPeak = 0; // for beat-detection flash
+
+  /** Set externally; returns true if a fresh beat (R-peak) just occurred */
+  public beatFlag = false;
+
+  setRhythm(r: RhythmId) {
+    if (r === this.rhythm) return;
+    this.rhythm = r;
+    this.tInBeat = 0;
+    this.beatIndex = 0;
+    this.nextIsPvc = false;
+    this.scheduleBeat();
+  }
+
+  setBpm(bpm: number) {
+    this.bpm = bpm;
+  }
+
+  getRhythm() {
+    return this.rhythm;
+  }
+
+  private baseRR(): number {
+    if (this.bpm <= 0) return 1;
+    return 60 / this.bpm;
+  }
+
+  private scheduleBeat() {
+    const r = this.rhythm;
+    let rr = this.baseRR();
+
+    if (r === "afib") {
+      // irregularly irregular
+      rr = rr * (0.6 + Math.random() * 0.85);
+    } else if (r === "pvc") {
+      // bigeminy: alternate sinus / PVC, the PVC comes early
+      this.nextIsPvc = this.beatIndex % 2 === 1;
+      if (this.nextIsPvc) rr = rr * 0.7;
+      else rr = rr * 1.15;
+    } else if (r === "nsr" || r === "brady") {
+      // subtle respiratory sinus arrhythmia
+      rr = rr * (1 + 0.04 * Math.sin(this.beatIndex * 0.7));
+    }
+    this.rr = Math.max(0.12, rr);
+  }
+
+  /** Advance the generator by dt seconds and return the amplitude (~ -0.4..1.2). */
+  step(dt: number): number {
+    this.clock += dt;
+    this.beatFlag = false;
+    const r = this.rhythm;
+
+    if (r === "asystole") {
+      return (Math.random() - 0.5) * 0.01; // tiny noise flatline
+    }
+
+    if (r === "vfib") {
+      // chaotic sum of drifting sines + noise
+      const c = this.clock;
+      let v = 0;
+      v += 0.32 * Math.sin(c * 19 + Math.sin(c * 3.1) * 2);
+      v += 0.22 * Math.sin(c * 11.5 + Math.sin(c * 1.7) * 3);
+      v += 0.18 * Math.sin(c * 27 + 1.2);
+      v += (Math.random() - 0.5) * 0.12;
+      return v * 0.85;
+    }
+
+    this.tInBeat += dt;
+    if (this.tInBeat >= this.rr) {
+      this.tInBeat -= this.rr;
+      this.beatIndex++;
+      this.scheduleBeat();
+    }
+
+    const t = this.tInBeat;
+    let v = 0;
+
+    if (r === "vtach") {
+      v = ventricularMorph(t);
+    } else if (r === "pvc") {
+      v = this.nextIsPvc ? ventricularMorph(t) : sinusMorph(t);
+    } else if (r === "afib") {
+      v = sinusMorph(t, {}) - gauss(t, 0.05, 0.018, 0.1); // strip P wave
+      // fibrillatory baseline
+      v += 0.035 * Math.sin(this.clock * 33) + 0.025 * Math.sin(this.clock * 51 + 1);
+    } else if (r === "stemi") {
+      v = sinusMorph(t, { stemi: true });
+    } else {
+      v = sinusMorph(t);
+    }
+
+    // R-peak detection for beat flash + audible blip
+    if (t > 0.18 && t < 0.21 && this.lastBeatPeak < 0.18) {
+      this.beatFlag = true;
+    }
+    this.lastBeatPeak = t;
+
+    return v;
+  }
+}
